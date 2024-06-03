@@ -32,7 +32,7 @@ on:
 jobs:
   jetson_tvm_rpc:
     if: ${{ github.repository == 'ekut-es/tvm' }}
-    runs-on: linux
+    runs-on: ubuntu-latest
     container: nvcr.io/nvidia/jetpack-linux-aarch64-crosscompile-x86:5.1.2
     steps:
       - uses: actions/checkout@v2
