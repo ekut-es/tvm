@@ -7,7 +7,6 @@ use crate::ir::relay::Expr;
 use crate::function::ffi::DLDataType;
 
 external! {
-    
     #[name("relay.op.nn._make.conv1d")]
     pub fn conv1d(data: Expr, 
         weight: Expr, 
