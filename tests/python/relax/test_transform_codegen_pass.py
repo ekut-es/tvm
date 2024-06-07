@@ -30,17 +30,17 @@ from tvm.relax.dpl import is_op, wildcard
 env_checker_codegen = tvm.get_global_func("relax.ext.tensorrt", True)
 env_checker_runtime = tvm.get_global_func("relax.is_tensorrt_runtime_enabled", True)
 
-has_tensorrt_codegen = pytest.mark.skipif(
+requires_tensorrt_codegen = pytest.mark.skipif(
     not env_checker_codegen,
     reason="TensorRT codegen not available",
 )
-has_tensorrt_runtime = pytest.mark.skipif(
+requires_tensorrt_runtime = pytest.mark.skipif(
     not env_checker_runtime or not env_checker_runtime(),
     reason="TensorRT runtime not available",
 )
 
 # Global variable in pytest that applies markers to all tests.
-pytestmark = [has_tensorrt_codegen, has_tensorrt_runtime]
+pytestmark = [requires_tensorrt_codegen] + tvm.testing.requires_cuda.marks()
 
 # Target gpu
 target_str = "nvidia/nvidia-t4"
@@ -117,6 +117,7 @@ entry_func_name = tvm.testing.parameter("main", "func")
 
 
 @tvm.testing.requires_gpu
+@requires_tensorrt_runtime
 def test_tensorrt_only(entry_func_name):
     mod, inputs, expected = setup_test()
 
@@ -146,6 +147,7 @@ def test_tensorrt_only(entry_func_name):
 
 
 @tvm.testing.requires_gpu
+@requires_tensorrt_runtime
 def test_mix_use_tensorrt_and_tvm():
     mod, inputs, expected = setup_test()
 
@@ -350,6 +352,35 @@ def test_dynamic_shape():
 
     after = relax.transform.RunCodegen()(Before)
     tvm.ir.assert_structural_equal(after["main"], Expected["main"])
+
+
+def test_no_op_for_call_to_tir():
+    """Calls to PrimFunc are ignored
+
+    RunCodegen should only update calls to Relax functions annotated
+    with the `"Codegen"` attribute.  Calls to any other function type
+    should be ignored.
+
+    This is a regression test.  Previous implementations performed an
+    unconditional cast from `tvm::BaseFunc` to `tvm::relax::Function`,
+    which produced an error.
+    """
+
+    @tvm.script.ir_module
+    class Before:
+        @R.function
+        def main(x: R.Tensor([4], "int64")):
+            R.func_attr({"relax.force_pure": True})
+            _ = Before.shape_func(x)
+            return x
+
+        @T.prim_func(private=True)
+        def shape_func(H: T.Buffer(T.int64(4), "int64")):
+            H[T.int64(0)] = H[T.int64(0)] + T.int64(1)
+
+    Expected = Before
+    After = relax.transform.RunCodegen()(Before)
+    tvm.ir.assert_structural_equal(Expected, After)
 
 
 # TODO(@sunggg):  test with more complex patterns (e.g., multiple annots, mixed codegens, different ops, const binding)

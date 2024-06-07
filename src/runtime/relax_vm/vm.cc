@@ -177,6 +177,20 @@ struct VMFrame {
 
   VMFrame(Index pc, Index register_file_size)
       : return_pc(pc), register_file(register_file_size), caller_return_register(0) {}
+
+  void Clear() {
+    this->caller_return_register = 0;
+    this->call_arg_values.clear();
+    this->call_arg_tcodes.clear();
+    for (RegType& reg : register_file) {
+      reg = nullptr;
+    }
+  }
+
+  void ResetForRecycle(Index pc, Index register_file_size) {
+    this->return_pc = pc;
+    this->register_file.resize(register_file_size);
+  }
 };
 
 class VirtualMachineImpl : public VirtualMachine {
@@ -322,6 +336,8 @@ class VirtualMachineImpl : public VirtualMachine {
     ~FrameGuard() {
       ICHECK_GT(vm->frames_.size(), 0);
       vm->pc_ = vm->frames_.back()->return_pc;
+      vm->frames_.back()->Clear();
+      vm->frame_free_list_.emplace_back(std::move(vm->frames_.back()));
       vm->frames_.pop_back();
     }
   };
@@ -335,7 +351,15 @@ class VirtualMachineImpl : public VirtualMachine {
    * \return A RAII wrapper that pops the frame when going out of scope.
    */
   FrameGuard PushFrame(Index ret_pc, const VMFuncInfo& vm_func) {
-    return FrameGuard(this, std::make_unique<VMFrame>(ret_pc, vm_func.register_file_size));
+    std::unique_ptr<VMFrame> new_frame;
+    if (!frame_free_list_.empty()) {
+      new_frame = std::move(frame_free_list_.back());
+      frame_free_list_.pop_back();
+      new_frame->ResetForRecycle(ret_pc, vm_func.register_file_size);
+    } else {
+      new_frame = std::make_unique<VMFrame>(ret_pc, vm_func.register_file_size);
+    }
+    return FrameGuard(this, std::move(new_frame));
   }
   /*!
    * \brief Write to a VM register.
@@ -343,7 +367,7 @@ class VirtualMachineImpl : public VirtualMachine {
    * \param reg The register to write to.
    * \param obj The object to write to.
    */
-  void WriteRegister(VMFrame* frame, RegName reg, const RegType& obj) {
+  TVM_ALWAYS_INLINE void WriteRegister(VMFrame* frame, RegName reg, const RegType& obj) {
     ICHECK_LT(reg, frame->register_file.size());
     frame->register_file[reg] = obj;
   }
@@ -353,7 +377,7 @@ class VirtualMachineImpl : public VirtualMachine {
    * \param reg The register to read from.
    * \return The value of the register.
    */
-  RegType ReadRegister(VMFrame* frame, RegName reg) {
+  TVM_ALWAYS_INLINE RegType ReadRegister(VMFrame* frame, RegName reg) {
     if (reg < Instruction::kBeginSpecialReg) {
       return frame->register_file[reg];
     }
@@ -372,10 +396,9 @@ class VirtualMachineImpl : public VirtualMachine {
   /*!
    * \brief Run call instruction.
    * \param curr_frame The current frame.
-   * \param callable The callable object, either PackedFunc or closure
    * \param inst The call instruction.
    */
-  virtual void RunInstrCall(VMFrame* curr_frame, const ObjectRef& callable, Instruction inst);
+  virtual void RunInstrCall(VMFrame* curr_frame, Instruction inst);
 
   /*! \brief Run VM dispatch loop. */
   void RunLoop();
@@ -426,6 +449,11 @@ class VirtualMachineImpl : public VirtualMachine {
    * \note: Use unique ptr to avoid re-allocation and copy when frames_ get resized.
    */
   std::vector<std::unique_ptr<VMFrame>> frames_;
+  /*!
+   * \brief A free list of frame
+   */
+  std::vector<std::unique_ptr<VMFrame>> frame_free_list_;
+
   /*! \brief The virtual machine PC. */
   Index pc_{0};
   /*! \brief The special return register. */
@@ -507,9 +535,6 @@ void VirtualMachineImpl::SetInput(std::string func_name, bool with_param_module,
 //------------------------------------------
 void VirtualMachineImpl::InvokeClosurePacked(const ObjectRef& closure_or_packedfunc, TVMArgs args,
                                              TVMRetValue* rv) {
-  ICHECK(closure_or_packedfunc.defined())
-      << "InvokeClosurePacked requires the callable object to be defined";
-
   // run packed call if it is a packed func.
   if (auto* packed = closure_or_packedfunc.as<PackedFunc::ContainerType>()) {
     packed->CallPacked(args, rv);
@@ -517,8 +542,7 @@ void VirtualMachineImpl::InvokeClosurePacked(const ObjectRef& closure_or_packedf
   }
   // run closure call.
   auto* clo = closure_or_packedfunc.as<VMClosureObj>();
-  ICHECK(clo != nullptr) << "Function expects a closure or PackedFunc, "
-                         << "but received " << closure_or_packedfunc->GetTypeKey();
+  ICHECK(clo != nullptr) << "Function expects a closure or PackedFunc ";
 
   std::vector<TVMValue> values(args.size() + 1);
   std::vector<int> tcodes(args.size() + 1);
@@ -600,8 +624,6 @@ Optional<VMClosure> VirtualMachineImpl::GetClosureInternal(const String& func_na
     auto impl = PackedFunc([gf_idx](TVMArgs args, TVMRetValue* rv) {
       // Per convention, ctx ptr is a VirtualMachine*
       VirtualMachine* ctx_ptr = static_cast<VirtualMachine*>(args[0].operator void*());
-      ICHECK(ctx_ptr) << "Context pointer for relax VM closure should be a VirtualMachine*, "
-                      << "but was NULL";
 
       std::vector<RegType> inputs(args.size() - 1);
       for (size_t i = 0; i < inputs.size(); ++i) {
@@ -651,7 +673,7 @@ RegType VirtualMachineImpl::InvokeBytecode(Index gf_idx, const std::vector<RegTy
   auto guard = PushFrame(this->pc_, gfunc);
   // Get new frame and set the caller info.
   VMFrame* curr_frame = frames_.back().get();
-  if (curr_instr.op == Opcode::Call || curr_instr.op == Opcode::CallFromRegister) {
+  if (curr_instr.op == Opcode::Call) {
     curr_frame->caller_return_register = curr_instr.dst;
   }
 
@@ -695,12 +717,8 @@ void VirtualMachineImpl::InitFuncPool() {
   }
 }
 
-void VirtualMachineImpl::RunInstrCall(VMFrame* curr_frame, const ObjectRef& callable,
-                                      Instruction instr) {
-  ICHECK(callable.defined()) << "RunInstrCall requires the callable object to be defined";
-  auto func_name = instr.op == Opcode::Call ? GetFuncName(instr.func_idx) : "<dynamic>";
-
-  DLOG(INFO) << "\n  pc = " << pc_ << ", execute: " << func_name;
+void VirtualMachineImpl::RunInstrCall(VMFrame* curr_frame, Instruction instr) {
+  DLOG(INFO) << "\n  pc = " << pc_ << ", execute: " << GetFuncName(instr.func_idx);
   int args_begin_offset = instrument_ != nullptr ? 4 : 0;
   // Use the call arg stack from the current frame to increase reuse
   // and avoid re-allocation
@@ -746,11 +764,11 @@ void VirtualMachineImpl::RunInstrCall(VMFrame* curr_frame, const ObjectRef& call
   ICHECK_LT(static_cast<size_t>(instr.func_idx), this->func_pool_.size());
 
   if (instrument_ == nullptr) {
-    this->InvokeClosurePacked(callable, args, &ret);
+    this->InvokeClosurePacked(func_pool_[instr.func_idx], args, &ret);
   } else {
     // insert light-weight instrument callback
-    setter(0, callable);
-    setter(1, func_name);
+    setter(0, func_pool_[instr.func_idx]);
+    setter(1, GetFuncName(instr.func_idx));
     setter(2, true);
     setter(3, nullptr);
     TVMRetValue rv;
@@ -769,7 +787,7 @@ void VirtualMachineImpl::RunInstrCall(VMFrame* curr_frame, const ObjectRef& call
       ret_kind = rv;
     }
     if (ret_kind != static_cast<int>(VMInstrumentReturnKind::kSkipRun)) {
-      this->InvokeClosurePacked(callable, args, &ret);
+      this->InvokeClosurePacked(func_pool_[instr.func_idx], args, &ret);
       setter(2, false);
       setter(3, ret);
       instrument_.CallPacked(TVMArgs(values.data(), tcodes.data(), values.size()), &rv);
@@ -793,11 +811,7 @@ void VirtualMachineImpl::RunLoop() {
     Instruction instr = exec_->GetInstruction(pc_);
     switch (instr.op) {
       case Opcode::Call: {
-        this->RunInstrCall(curr_frame, func_pool_[instr.func_idx], instr);
-        break;
-      }
-      case Opcode::CallFromRegister: {
-        this->RunInstrCall(curr_frame, ReadRegister(curr_frame, instr.func_idx), instr);
+        this->RunInstrCall(curr_frame, instr);
         break;
       }
       case Opcode::Ret: {
@@ -1015,7 +1029,7 @@ class VirtualMachineProfiler : public VirtualMachineImpl {
   }
 
  protected:
-  void RunInstrCall(VMFrame* curr_frame, const ObjectRef& callable, Instruction inst) override {
+  void RunInstrCall(VMFrame* curr_frame, Instruction inst) override {
     bool profiling = false;
     if (prof_ && prof_->IsRunning()) {
       auto f_name = GetFuncName(inst.func_idx);
@@ -1051,7 +1065,7 @@ class VirtualMachineProfiler : public VirtualMachineImpl {
       }
     }
 
-    VirtualMachineImpl::RunInstrCall(curr_frame, callable, inst);
+    VirtualMachineImpl::RunInstrCall(curr_frame, inst);
 
     if (profiling) {
       prof_->StopCall();
