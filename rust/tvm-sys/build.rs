@@ -138,8 +138,11 @@ fn find_using_tvm_build() -> Result<TVMInstall> {
     if cfg!(feature = "use-mkl") {
         build_config.settings.use_mkl = CMakeSetting::from_str("on").ok();
     }
-    if cfg!(feature = "use-dnnl") {
-        build_config.settings.use_dnnl= Some(true);
+    if cfg!(feature = "use-mkldnn") {
+        build_config.settings.use_mkldnn = CMakeSetting::from_str("on").ok();
+    }
+    if cfg!(feature = "use-dnnl-codegen") {
+        build_config.settings.use_dnnl_codegen = Some(true);
     }
     if cfg!(feature = "use-cudnn") {
         build_config.settings.use_cudnn = Some(true);
