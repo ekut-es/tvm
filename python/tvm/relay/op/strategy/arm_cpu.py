@@ -110,6 +110,8 @@ def conv2d_strategy_arm_cpu(attrs, inputs, out_type, target):
     """conv2d arm cpu strategy"""
     strategy = _op.OpStrategy()
     data, kernel = inputs
+    data_shape = data.shape
+    kernel_shape = kernel.shape
     dilation_h, dilation_w = attrs.get_int_tuple("dilation")
     stride_h, stride_w = attrs.get_int_tuple("strides")
     padding = attrs.get_int_tuple("padding")
@@ -258,6 +260,11 @@ def conv2d_strategy_arm_cpu(attrs, inputs, out_type, target):
                         target.features.has_sme
                         and kernel.dtype == data.dtype
                         and out_type.dtype == "float32"
+                        and data_shape[0] == 1
+                        # The schedule uses tensorization which does not work when the
+                        # reduction axis of the gemm has unit iters. See
+                        # https://github.com/apache/tvm/issues/16566
+                        and (data_shape[3] * kernel_shape[0] * kernel_shape[1]) > 1
                     ):
                         strategy.add_implementation(
                             wrap_compute_conv2d(topi.arm_cpu.compute_conv2d_NHWC_hybrid_SME),
@@ -729,6 +736,18 @@ def schedule_dense_arm_cpu(attrs, inputs, out_type, target):
             plevel=12,
         )
 
+    if (
+        target.features.is_aarch64
+        and data.dtype in ["float16", "float32"]
+        and weight.dtype in ["float16", "float32"]
+        and out_type.dtype in ["float16", "float32"]
+    ):
+        strategy.add_implementation(
+            wrap_compute_dense(topi.arm_cpu.dense_gemm),
+            wrap_topi_schedule(topi.arm_cpu.schedule_dense_gemm),
+            name="dense_gemm.arm_cpu",
+            plevel=11,
+        )
     # Fallback to x86 schedules as there is currently no arm_cpu schedule for dense
     strategy.add_implementation(
         wrap_compute_dense(topi.x86.dense_nopack),
@@ -772,6 +791,19 @@ def matmul_strategy_arm_cpu(attrs, inputs, out_type, target):
             wrap_compute_matmul(topi.arm_cpu.compute_matmul_sme),
             lambda: None,
             name="matmul.arm_cpu.sme",
+        )
+    elif (
+        target.features.is_aarch64
+        and data.dtype in ["float16", "float32"]
+        and weight.dtype in ["float16", "float32"]
+        and out_type.dtype in ["float16", "float32"]
+        and not (attrs.transpose_a or attrs.transpose_b)
+        and len(data.shape) == 2
+    ):
+        strategy.add_implementation(
+            wrap_compute_matmul(topi.arm_cpu.dense_gemm),
+            wrap_topi_schedule(topi.arm_cpu.schedule_dense_gemm),
+            name="matmul.arm_cpu.neon",
         )
         return strategy
 

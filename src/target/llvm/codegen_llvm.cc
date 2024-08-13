@@ -2317,6 +2317,16 @@ TVM_REGISTER_GLOBAL("tvm.codegen.llvm.GetHostCPUName").set_body_typed([]() -> st
 
 TVM_REGISTER_GLOBAL("tvm.codegen.llvm.GetHostCPUFeatures")
     .set_body_typed([]() -> Map<String, IntImm> {
+#if TVM_LLVM_VERSION >= 200
+      Map<String, IntImm> ret;
+      auto features = llvm::sys::getHostCPUFeatures();
+      for (auto it = features.begin(); it != features.end(); ++it) {
+        std::string name = it->getKey().str();
+        bool value = it->getValue();
+        ret.Set(name, IntImm(DataType::Bool(), value));
+      }
+      return ret;
+#else
       llvm::StringMap<bool> features;
       if (llvm::sys::getHostCPUFeatures(features)) {
         Map<String, IntImm> ret;
@@ -2327,6 +2337,7 @@ TVM_REGISTER_GLOBAL("tvm.codegen.llvm.GetHostCPUFeatures")
         }
         return ret;
       }
+#endif
       LOG(WARNING) << "Current version of LLVM does not support feature detection on your CPU";
       return {};
     });
