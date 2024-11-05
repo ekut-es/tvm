@@ -73,7 +73,7 @@
 #endif
 
 // TVM version
-#define TVM_VERSION "0.18.dev0"
+#define TVM_VERSION "0.19.dev0"
 
 // TVM Runtime is DLPack compatible.
 #include <dlpack/dlpack.h>
@@ -209,7 +209,6 @@ typedef DLTensor* TVMArrayHandle;
  */
 typedef union {
   int64_t v_int64;
-  bool v_bool;
   double v_float64;
   void* v_handle;
   const char* v_str;

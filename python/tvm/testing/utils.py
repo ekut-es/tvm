@@ -949,6 +949,9 @@ requires_matrixcore = Feature(
     parent_features="rocm",
 )
 
+# Mark a test as requiring the hipBLAS library.
+requires_hipblas = Feature("hipblas", "hipBLAS", cmake_flag="USE_HIPBLAS", parent_features="rocm")
+
 # Mark a test as requiring the metal runtime
 requires_metal = Feature(
     "metal",
@@ -977,6 +980,12 @@ requires_openclml = Feature(
     target_kind_enabled="opencl",
 )
 
+# Mark a test as requiring NNAPI support in build.
+requires_nnapi = Feature(
+    "NNAPI",
+    "NNAPI",
+    cmake_flag="USE_NNAPI_CODEGEN",
+)
 
 # Mark a test as requiring microTVM to run
 requires_micro = Feature("micro", "MicroTVM", cmake_flag="USE_MICRO")

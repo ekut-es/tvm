@@ -57,8 +57,10 @@ namespace relax_vm {
 constexpr const int kPagedKVCacheMaxBlockDepth = 2;
 /*! \brief The maximum tree size of a single sequence in tree attention. */
 constexpr const int kTreeAttnMaxTreeSize = 256;
-/*! \brief The 8MB workspace size for attention auxiliary data. */
-constexpr const int kAttnWorkspaceByte = 128 * 1024 * 1024;
+/*! \brief The 1MB workspace size for integer attention auxiliary data. */
+constexpr const int kIntAttnWorkspaceByte = 1 * 1024 * 1024;
+/*! \brief The 128MB workspace size for floating-point attention auxiliary data. */
+constexpr const int kFloatAttnWorkspaceByte = 768 * 1024 * 1024;
 /*! \brief The id of the temporary logical page, which is useful for sliding window. */
 constexpr const int kPagedKVCacheTempPageId = -1;
 
@@ -330,9 +332,9 @@ class PagedKVCacheAuxDataManager {
    */
   virtual NDArray CopyAppendPositionMapAsync(HostMemoryVector* data) = 0;
   /*! \brief Copy the tree attention mask. */
-  virtual NDArray CopyTreeAttnMaskAsync(HostMemoryVector* data) = 0;
+  virtual NDArray CopyTreeAttnMaskOnDepthAsync(HostMemoryVector* data, int depth) = 0;
   /*! \brief Copy the mn indptr of the tree attention mask. */
-  virtual NDArray CopyTreeAttnMNIndptrAsync(HostMemoryVector* data) = 0;
+  virtual NDArray CopyTreeAttnMNIndptrOnDepthAsync(HostMemoryVector* data, int depth) = 0;
   /*! \brief Commit all the attention auxiliary data copy operations since the last commit. */
   virtual void CommitAttnAuxDataCopy() = 0;
 
@@ -379,14 +381,15 @@ class PlainPagedKVCacheAuxDataManager : public PagedKVCacheAuxDataManager {
           NDArray::Empty({3, reserved_num_seqs}, dtype_aux_, device));
       k_rope_pos_offset_on_depths_device_.push_back(
           NDArray::Empty({reserved_num_seqs}, dtype_aux_, device));
+      tree_attn_mask_device_.push_back(NDArray::Empty(
+          {kTreeAttnMaxTreeSize * kTreeAttnMaxTreeSize * reserved_num_seqs}, dtype_aux_, device));
+      tree_attn_mn_indptr_device_.push_back(
+          NDArray::Empty({reserved_num_seqs + 1}, dtype_aux_, device));
     }
     cur_append_length_indptr_device_ = NDArray::Empty({reserved_num_seqs + 1}, dtype_aux_, device);
     k_ragged_rope_pos_offset_device_ = NDArray::Empty({reserved_num_seqs}, dtype_aux_, device);
     q_rope_position_map_device_ = NDArray::Empty({prefill_chunk_size}, dtype_aux_, device);
     append_position_map_device_ = NDArray::Empty({prefill_chunk_size}, dtype_aux_, device);
-    tree_attn_mask_device_ = NDArray::Empty(
-        {kTreeAttnMaxTreeSize * kTreeAttnMaxTreeSize * reserved_num_seqs}, dtype_aux_, device);
-    tree_attn_mn_indptr_device_ = NDArray::Empty({reserved_num_seqs + 1}, dtype_aux_, device);
 
     commit_copy_length_indptr_device_ = NDArray::Empty({reserved_num_seqs + 1}, dtype_aux_, device);
     commit_copy_src_dst_pos_in_page_table_device_ =
@@ -450,15 +453,15 @@ class PlainPagedKVCacheAuxDataManager : public PagedKVCacheAuxDataManager {
     CopyVecDataToArray(view, data->data());
     return view;
   }
-  NDArray CopyTreeAttnMaskAsync(HostMemoryVector* data) final {
+  NDArray CopyTreeAttnMaskOnDepthAsync(HostMemoryVector* data, int depth) final {
     NDArray view =
-        tree_attn_mask_device_.CreateView({static_cast<int64_t>(data->size())}, dtype_aux_);
+        tree_attn_mask_device_[depth].CreateView({static_cast<int64_t>(data->size())}, dtype_aux_);
     CopyVecDataToArray(view, data->data());
     return view;
   }
-  NDArray CopyTreeAttnMNIndptrAsync(HostMemoryVector* data) final {
-    NDArray view =
-        tree_attn_mn_indptr_device_.CreateView({static_cast<int64_t>(data->size())}, dtype_aux_);
+  NDArray CopyTreeAttnMNIndptrOnDepthAsync(HostMemoryVector* data, int depth) final {
+    NDArray view = tree_attn_mn_indptr_device_[depth].CreateView(
+        {static_cast<int64_t>(data->size())}, dtype_aux_);
     CopyVecDataToArray(view, data->data());
     return view;
   }
@@ -557,12 +560,12 @@ class PlainPagedKVCacheAuxDataManager : public PagedKVCacheAuxDataManager {
   std::vector<NDArray> page_indices_on_depths_device_;
   std::vector<NDArray> length_info_on_depths_device_;
   std::vector<NDArray> k_rope_pos_offset_on_depths_device_;
+  std::vector<NDArray> tree_attn_mask_device_;
+  std::vector<NDArray> tree_attn_mn_indptr_device_;
   NDArray cur_append_length_indptr_device_;
   NDArray k_ragged_rope_pos_offset_device_;
   NDArray q_rope_position_map_device_;
   NDArray append_position_map_device_;
-  NDArray tree_attn_mask_device_;
-  NDArray tree_attn_mn_indptr_device_;
   NDArray commit_copy_length_indptr_device_;
   NDArray commit_copy_src_dst_pos_in_page_table_device_;
 };
@@ -630,10 +633,11 @@ class CachedPagedKVCacheAuxDataManager : public PagedKVCacheAuxDataManager {
   NDArray CopyAppendPositionMapAsync(HostMemoryVector* data) final {
     return CopyAttnAuxVecToCache(data);
   }
-  NDArray CopyTreeAttnMaskAsync(HostMemoryVector* data) final {
-    return CopyAttnAuxVecToCache(data);
+  NDArray CopyTreeAttnMaskOnDepthAsync(HostMemoryVector* data, int depth) final {
+    NDArray mask_1d = CopyAttnAuxVecToCache(data);
+    return mask_1d.CreateView({static_cast<int64_t>(data->size() / 2), 2}, mask_1d->dtype);
   }
-  NDArray CopyTreeAttnMNIndptrAsync(HostMemoryVector* data) final {
+  NDArray CopyTreeAttnMNIndptrOnDepthAsync(HostMemoryVector* data, int depth) final {
     return CopyAttnAuxVecToCache(data);
   }
   NDArray CopyLengthInfoOnDepthAsync(HostMemoryVector* last_page_len,
@@ -848,6 +852,8 @@ class PagedAttentionKVCacheObj : public AttentionKVCacheObj {
   const double rotary_scale_;
   /*! \brief The RoPE theta. */
   const double rotary_theta_;
+  /*! \brief The optional RoPE extension factors for RoPE scaling. */
+  const Optional<NDArray> rope_ext_factors_;
 
   /*! \brief We fix int32 to be the index dtype of auxiliary data. */
   const DLDataType dtype_aux_ = DLDataType(DataType::Int(32, 1));
@@ -892,7 +898,7 @@ class PagedAttentionKVCacheObj : public AttentionKVCacheObj {
   /*! \brief The append lengths of the sequences in the current round of forwarding. */
   IntTuple cur_append_lengths_;
   /*! \brief Whether the current batch of sequences are token chains (not token trees). */
-  bool is_chain_;
+  std::vector<bool> is_chain_on_depths_;
   /*! \brief Number of fork depth in the current round of forward. */
   int num_depths_;
   /*! \brief Whether to compute attention after appending KV into cache or not. */
@@ -911,7 +917,8 @@ class PagedAttentionKVCacheObj : public AttentionKVCacheObj {
   NDArray temp_attn_output_device_;
   NDArray temp_attn_scores_device_;
   NDArray merged_attn_scores_device_;
-  std::vector<NDArray> temp_attn_workspace_;
+  std::vector<NDArray> temp_int_attn_workspace_;
+  NDArray temp_float_attn_workspace_;
 
   //-------------------------------------------
   // Below are the auxiliary data structure on CPU.
@@ -928,8 +935,8 @@ class PagedAttentionKVCacheObj : public AttentionKVCacheObj {
   HostMemoryVector q_rope_position_map_host_;
   HostMemoryVector append_position_map_host_;
   HostMemoryVector cur_append_lengths_indptr_host_;
-  HostMemoryVector tree_attn_mask_host_;
-  HostMemoryVector tree_attn_mn_indptr_host_;
+  std::vector<HostMemoryVector> tree_attn_mask_host_;
+  std::vector<HostMemoryVector> tree_attn_mn_indptr_host_;
   HostMemoryVector commit_copy_length_indptr_host_;
   HostMemoryVector commit_copy_src_pos_in_page_table_host_;
   HostMemoryVector commit_copy_dst_pos_in_page_table_host_;
@@ -945,8 +952,6 @@ class PagedAttentionKVCacheObj : public AttentionKVCacheObj {
   NDArray k_ragged_rope_pos_offset_view_;
   NDArray q_rope_position_map_view_;
   NDArray append_position_map_view_;
-  NDArray tree_attn_mask_view_;
-  NDArray tree_attn_mn_indptr_view_;
   NDArray temp_attn_output_view_;
   NDArray temp_attn_scores_view_;
   NDArray merged_attn_scores_view_;
@@ -955,6 +960,8 @@ class PagedAttentionKVCacheObj : public AttentionKVCacheObj {
   std::vector<NDArray> page_indices_on_depths_view_;
   std::vector<NDArray> length_info_on_depths_view_;
   std::vector<NDArray> k_rope_pos_offset_view_;
+  std::vector<NDArray> tree_attn_mask_view_;
+  std::vector<NDArray> tree_attn_mn_indptr_view_;
 
   PackedFunc f_transpose_append_;
   PackedFunc f_compact_copy_;
@@ -964,6 +971,7 @@ class PagedAttentionKVCacheObj : public AttentionKVCacheObj {
   PackedFunc f_attention_decode_sliding_window_;
   PackedFunc f_attention_prefill_ragged_;
   PackedFunc f_attention_prefill_with_tree_mask_;
+  PackedFunc f_attention_prefill_with_tree_mask_paged_kv_;
   Optional<PackedFunc> f_attention_prefill_ragged_begin_forward_;
   Optional<PackedFunc> f_attention_prefill_ragged_end_forward_;
   Optional<PackedFunc> f_attention_prefill_begin_forward_;
@@ -988,11 +996,13 @@ class PagedAttentionKVCacheObj : public AttentionKVCacheObj {
       int64_t page_size, int64_t num_layers, int64_t layer_id_begin_offset,  //
       int64_t num_qo_heads, int64_t num_kv_heads, int64_t head_dim, int64_t reserved_num_seqs,
       int64_t num_total_pages, int64_t prefill_chunk_size, bool support_sliding_window,
-      RoPEMode rope_mode, double rotary_scale, double rotary_theta, DLDataType dtype, Device device,
+      RoPEMode rope_mode, double rotary_scale, double rotary_theta,
+      Optional<NDArray> rope_ext_factors, DLDataType dtype, Device device,
       PackedFunc f_transpose_append, PackedFunc f_compact_copy, PackedFunc f_attention_prefill,
       PackedFunc f_attention_decode, PackedFunc f_attention_prefill_sliding_window,
       PackedFunc f_attention_decode_sliding_window, PackedFunc f_attention_prefill_ragged,
       PackedFunc f_attention_prefill_with_tree_mask,
+      PackedFunc f_attention_prefill_with_tree_mask_paged_kv,
       Optional<PackedFunc> f_attention_prefill_ragged_begin_forward,
       Optional<PackedFunc> f_attention_prefill_ragged_end_forward,
       Optional<PackedFunc> f_attention_prefill_begin_forward,
@@ -1013,6 +1023,7 @@ class PagedAttentionKVCacheObj : public AttentionKVCacheObj {
                                                                           : rope_mode),
         rotary_scale_(rotary_scale),
         rotary_theta_(rotary_theta),
+        rope_ext_factors_(std::move(rope_ext_factors)),
         f_transpose_append_(std::move(f_transpose_append)),
         f_compact_copy_(std::move(f_compact_copy)),
         f_attention_prefill_(std::move(f_attention_prefill)),
@@ -1021,6 +1032,8 @@ class PagedAttentionKVCacheObj : public AttentionKVCacheObj {
         f_attention_decode_sliding_window_(std::move(f_attention_decode_sliding_window)),
         f_attention_prefill_ragged_(std::move(f_attention_prefill_ragged)),
         f_attention_prefill_with_tree_mask_(std::move(f_attention_prefill_with_tree_mask)),
+        f_attention_prefill_with_tree_mask_paged_kv_(
+            std::move(f_attention_prefill_with_tree_mask_paged_kv)),
         f_attention_prefill_ragged_begin_forward_(
             std::move(f_attention_prefill_ragged_begin_forward)),
         f_attention_prefill_ragged_end_forward_(std::move(f_attention_prefill_ragged_end_forward)),
@@ -1055,6 +1068,10 @@ class PagedAttentionKVCacheObj : public AttentionKVCacheObj {
           HostMemoryVector(reserved_num_seqs, dtype_aux_, preferred_host_device));
       k_rope_pos_offset_on_depths_host_.push_back(
           HostMemoryVector(reserved_num_seqs, dtype_aux_, preferred_host_device));
+      tree_attn_mask_host_.push_back(HostMemoryVector(kTreeAttnMaxTreeSize * 2 * reserved_num_seqs,
+                                                      dtype_aux_, preferred_host_device));
+      tree_attn_mn_indptr_host_.push_back(
+          HostMemoryVector(reserved_num_seqs + 1, dtype_aux_, preferred_host_device));
     }
     k_ragged_rope_pos_offset_host_ =
         HostMemoryVector(reserved_num_seqs, dtype_aux_, preferred_host_device);
@@ -1063,11 +1080,6 @@ class PagedAttentionKVCacheObj : public AttentionKVCacheObj {
     append_position_map_host_ =
         HostMemoryVector(prefill_chunk_size, dtype_aux_, preferred_host_device);
     cur_append_lengths_indptr_host_ =
-        HostMemoryVector(reserved_num_seqs + 1, dtype_aux_, preferred_host_device);
-    tree_attn_mask_host_ =
-        HostMemoryVector(kTreeAttnMaxTreeSize * kTreeAttnMaxTreeSize * reserved_num_seqs,
-                         dtype_aux_, preferred_host_device);
-    tree_attn_mn_indptr_host_ =
         HostMemoryVector(reserved_num_seqs + 1, dtype_aux_, preferred_host_device);
     commit_copy_length_indptr_host_ =
         HostMemoryVector(reserved_num_seqs + 1, dtype_aux_, preferred_host_device);
@@ -1080,19 +1092,24 @@ class PagedAttentionKVCacheObj : public AttentionKVCacheObj {
 
     for (int d = 0; d < kPagedKVCacheMaxBlockDepth; ++d) {
       if (NeedKernelBeginForward()) {
-        temp_attn_workspace_.push_back(
-            NDArray::Empty({kAttnWorkspaceByte / 4}, DataType::Float(32), device));
+        temp_int_attn_workspace_.push_back(
+            NDArray::Empty({kIntAttnWorkspaceByte / 4}, DataType::Float(32), device));
       }
       qo_indptr_on_depths_view_.push_back(NDArray());
       page_indptr_on_depths_view_.push_back(NDArray());
       page_indices_on_depths_view_.push_back(NDArray());
       length_info_on_depths_view_.push_back(NDArray());
       k_rope_pos_offset_view_.push_back(NDArray());
+      tree_attn_mask_view_.push_back(NDArray());
+      tree_attn_mn_indptr_view_.push_back(NDArray());
+      is_chain_on_depths_.push_back(true);
     }
     // Additional workspace for the "prefill with ragged kv" kernel.
     if (NeedKernelBeginForward()) {
-      temp_attn_workspace_.push_back(
-          NDArray::Empty({kAttnWorkspaceByte / 4}, DataType::Float(32), device));
+      temp_int_attn_workspace_.push_back(
+          NDArray::Empty({kIntAttnWorkspaceByte / 4}, DataType::Float(32), device));
+      temp_float_attn_workspace_ =
+          NDArray::Empty({kFloatAttnWorkspaceByte / 4}, DataType::Float(32), device);
     }
 
     temp_attn_q_device_ =
@@ -1131,6 +1148,12 @@ class PagedAttentionKVCacheObj : public AttentionKVCacheObj {
       aux_data_manager_ = std::make_unique<PlainPagedKVCacheAuxDataManager>(
           reserved_num_seqs, num_total_pages, prefill_chunk_size, dtype_aux_, device,
           preferred_host_device, copy_stream_);
+    }
+
+    // Right now only the "normal" RoPE mode supports the RoPE extention factors.
+    if (rope_ext_factors_.defined()) {
+      CHECK(rope_mode_ == RoPEMode::kNormal)
+          << "The RoPE mode must be normal to support RoPE extension factors.";
     }
   }
 
@@ -1482,34 +1505,16 @@ class PagedAttentionKVCacheObj : public AttentionKVCacheObj {
       sequences.push_back(&it->second);
       last_block_length_before_append.push_back(
           global_block_pool_[it->second.last_block_idx].seq_length);
-      k_ragged_rope_pos_offset_host_.push_back(it->second.seq_length);
+      int k_rope_offset = it->second.seq_length;
+      if (!it->second.accepted_indices_committed) {
+        int tree_size = static_cast<int>(it->second.token_tree_parent_ptr.size());
+        k_rope_offset -= tree_size;
+      }
+      k_ragged_rope_pos_offset_host_.push_back(k_rope_offset);
       it->second.seq_length += append_lengths[i];
       if (append_lengths[i] != 1) {
         is_decode_request_ = false;
       }
-    }
-
-    // - Check token tree validity and process the token tree.
-    is_chain_ = true;
-    tree_attn_mask_host_.clear();
-    tree_attn_mn_indptr_host_.clear();
-    if (opt_token_tree_parent_ptr.defined()) {
-      is_chain_ = ConstructTokenTreeMask(sequences, opt_token_tree_parent_ptr.value());
-    } else {
-      // The input batch does not form trees. So each sequence in the batch
-      // is required to have all past accepted tokens committed.
-      for (int i = 0; i < cur_batch_size_; ++i) {
-        Sequence* sequence = sequences[i];
-        CHECK(sequence->accepted_indices_committed)
-            << "The input batch does not form a tree, in which case the sequences in the input "
-               "batch are expected to have their accepted tokens token tree nodes committed. "
-               "Please invoke CommitAcceptedTokenTreeNodes for sequence "
-            << seq_ids[i];
-        sequence->is_chain = true;
-        sequence->token_tree_parent_ptr.clear();
-        sequence->token_tree_node_depths.clear();
-      }
-      is_chain_ = true;
     }
 
     auto [block_ids_on_depths, trailing_blocks] = GetBlockIdsOnDepth(sequences);
@@ -1540,6 +1545,36 @@ class PagedAttentionKVCacheObj : public AttentionKVCacheObj {
       // When GQA group size is at least 4 and FlashInfer is enabled,
       // we always use prefill kernel for better performance.
       std::fill(use_decode_kernel_.begin(), use_decode_kernel_.end(), /*value=*/false);
+    }
+
+    bool has_previous_tree =
+        std::any_of(sequences.begin(), sequences.end(),
+                    [](const Sequence* sequence) { return !sequence->accepted_indices_committed; });
+    if (has_previous_tree) {
+      append_before_attn_ = true;
+    }
+
+    // - Check token tree validity and process the token tree.
+    if (opt_token_tree_parent_ptr.defined()) {
+      CHECK(!support_sliding_window_) << "Tree attention does not support sliding window.";
+      CHECK(rope_mode_ != RoPEMode::kInline) << "Tree attention does not support inline RoPE mode.";
+      ConstructTokenTreeMask(sequences, opt_token_tree_parent_ptr.value(), block_ids_on_depths,
+                             trailing_blocks);
+    } else {
+      // The input batch does not form trees. So each sequence in the batch
+      // is required to have all past accepted tokens committed.
+      for (int i = 0; i < cur_batch_size_; ++i) {
+        Sequence* sequence = sequences[i];
+        CHECK(sequence->accepted_indices_committed)
+            << "The input batch does not form a tree, in which case the sequences in the input "
+               "batch are expected to have their accepted tokens token tree nodes committed. "
+               "Please invoke CommitAcceptedTokenTreeNodes for sequence "
+            << seq_ids[i];
+        sequence->is_chain = true;
+        sequence->token_tree_parent_ptr.clear();
+        sequence->token_tree_node_depths.clear();
+      }
+      std::fill(is_chain_on_depths_.begin(), is_chain_on_depths_.end(), true);
     }
 
     if (append_before_attn_) {
@@ -1646,9 +1681,16 @@ class PagedAttentionKVCacheObj : public AttentionKVCacheObj {
       int64_t append_length = append_lengths[i];
       const Block& block = global_block_pool_[sequences[i]->last_block_idx];
       for (int64_t pos = 0; pos < append_length; ++pos) {
-        q_rope_position_map_host_.push_back(
-            k_ragged_rope_pos_offset_host_[i] +
-            (is_chain_ ? pos : sequences[i]->token_tree_node_depths[pos]));
+        if (sequences[i]->token_tree_node_depths.empty()) {
+          q_rope_position_map_host_.push_back(k_ragged_rope_pos_offset_host_[i] + pos);
+        } else {
+          int64_t offset_in_tree =
+              static_cast<int64_t>(sequences[i]->token_tree_parent_ptr.size()) - append_length;
+          ICHECK_GE(offset_in_tree, 0);
+          q_rope_position_map_host_.push_back(
+              k_ragged_rope_pos_offset_host_[i] +
+              sequences[i]->token_tree_node_depths[offset_in_tree + pos]);
+        }
 
         int32_t pos_in_block = block.seq_length - append_length + pos;
         if (last_block_length_before_append[i] + pos < block.sink_length) {
@@ -1713,7 +1755,7 @@ class PagedAttentionKVCacheObj : public AttentionKVCacheObj {
     for (int64_t seq_id = 0; seq_id < cur_batch_size_; ++seq_id) {
       total_seq_length += cur_append_lengths_[seq_id];
     }
-    CHECK_EQ(total_seq_length, qkv_data->shape[0]);
+    CHECK_LE(total_seq_length, qkv_data->shape[0]);
     // Sync the copy stream and the compute stream.
     ComputeStreamWaitForCopyStream();
     // The auxiliary data structure on device must have been synchronized.
@@ -1725,16 +1767,30 @@ class PagedAttentionKVCacheObj : public AttentionKVCacheObj {
                                                     qkv_data->dtype);
     NDArray v_data = temp_attn_v_device_.CreateView({total_seq_length, num_kv_heads_, head_dim_},
                                                     qkv_data->dtype);
+
+    NDArray qkv_data_view = qkv_data;
+    NDArray o_data_view = o_data;
+    if (total_seq_length != qkv_data->shape[0]) {
+      qkv_data_view = qkv_data.CreateView(
+          {total_seq_length, qkv_data->shape[1], qkv_data->shape[2]}, qkv_data->dtype);
+      o_data_view =
+          o_data.CreateView({total_seq_length, num_qo_heads_, head_dim_}, qkv_data->dtype);
+    }
     // Part 2. Split fused qkv and apply rotary embedding to q/k data.
-    f_split_rotary_(qkv_data, q_rope_position_map_view_, q_data, k_data, v_data,
-                    rope_mode_ == RoPEMode::kNormal);
+    if (!rope_ext_factors_.defined()) {
+      f_split_rotary_(qkv_data_view, q_rope_position_map_view_, q_data, k_data, v_data,
+                      static_cast<int>(rope_mode_ == RoPEMode::kNormal));
+    } else {
+      f_split_rotary_(qkv_data_view, q_rope_position_map_view_, q_data, k_data, v_data,
+                      rope_ext_factors_.value());
+    }
 
     // Part 3. Append k/v data to kv-cache if flag "append_before_attn" is set.
     if (append_before_attn_) {
       f_transpose_append_(pages_[local_layer_id], k_data, v_data, append_position_map_view_);
     }
     // Part 4: perform attention
-    AttentionInternal(layer_id, q_data, k_data, v_data, o_data, attn_score_scaling_factor);
+    AttentionInternal(layer_id, q_data, k_data, v_data, o_data_view, attn_score_scaling_factor);
     // Part 5. Append k/v data to kv-cache if flag "append_before_attn" is not set.
     if (!append_before_attn_) {
       f_transpose_append_(pages_[local_layer_id], k_data, v_data, append_position_map_view_);
@@ -1748,12 +1804,14 @@ class PagedAttentionKVCacheObj : public AttentionKVCacheObj {
 
     std::vector<Sequence*> sequences;
     sequences.reserve(num_seq_to_commit);
+    bool is_chain = true;
     for (int i = 0; i < num_seq_to_commit; ++i) {
       auto it = seq_map_.find(seq_ids[i]);
       CHECK(it != seq_map_.end()) << "The sequence \"" << seq_ids[i]
                                   << "\" cannot be found in KV cache.";
       sequences.push_back(&it->second);
-      CHECK(!it->second.accepted_indices_committed)
+      is_chain = it->second.is_chain;
+      CHECK(leaf_indices[i] == -1 || !it->second.accepted_indices_committed)
           << "The accepted nodes of sequence " << seq_ids[i] << " are already committed.";
       CHECK_GE(leaf_indices[i], -1)
           << "Invalid tree index " << leaf_indices[i] << " which is less than -1";
@@ -1763,7 +1821,7 @@ class PagedAttentionKVCacheObj : public AttentionKVCacheObj {
           << it->second.token_tree_parent_ptr.size() << " of the sequence";
     }
 
-    if (!is_chain_) {
+    if (!is_chain) {
       commit_copy_length_indptr_host_.clear();
       commit_copy_src_pos_in_page_table_host_.clear();
       commit_copy_dst_pos_in_page_table_host_.clear();
@@ -1772,6 +1830,7 @@ class PagedAttentionKVCacheObj : public AttentionKVCacheObj {
       for (int i = 0; i < num_seq_to_commit; ++i) {
         if (leaf_indices[i] == -1) {
           // No node is accepted. All nodes in the token tree need to be popped.
+          commit_copy_length_indptr_host_.push_back(commit_copy_length_indptr_host_.back());
           continue;
         }
 
@@ -1920,78 +1979,134 @@ class PagedAttentionKVCacheObj : public AttentionKVCacheObj {
     return block_idx;
   }
 
-  bool ConstructTokenTreeMask(const std::vector<Sequence*>& sequences,
-                              const IntTuple& token_tree_parent_ptr) {
-    // We check if the token tree deteriorates to a chain,
-    // because chain cases can have simplified attention work flow.
-    bool is_chain = true;
-    int64_t sum_new_append_length = 0;
-    // - Construct the mn indptr array, which is the indptr of the mask size of each sequence.
-    tree_attn_mn_indptr_host_.push_back(0);
-    ICHECK_EQ(sequences.size(), cur_batch_size_);
-    ICHECK_EQ(cur_append_lengths_.size(), cur_batch_size_);
-    for (int i = 0; i < cur_batch_size_; ++i) {
-      int64_t append_length = cur_append_lengths_[i];
-      // Update the token tree parent pointers.
-      sequences[i]->token_tree_parent_ptr = {
-          token_tree_parent_ptr->data + sum_new_append_length,
-          token_tree_parent_ptr->data + sum_new_append_length + cur_append_lengths_[i]};
-      sum_new_append_length += cur_append_lengths_[i];
-
-      CHECK_LE(append_length, kTreeAttnMaxTreeSize)
-          << "The tree size is " << append_length << " which exceeds the maximum tree size limit "
-          << kTreeAttnMaxTreeSize;
-      tree_attn_mn_indptr_host_.push_back(tree_attn_mn_indptr_host_.back() +
-                                          append_length * append_length);
-    }
-    CHECK_EQ(token_tree_parent_ptr.size(), sum_new_append_length)
-        << "Invalid token tree size. The sum of \"append_lengths\" is " << sum_new_append_length
-        << " while there are " << token_tree_parent_ptr.size()
-        << " elements in \"token_tree_parent_ptr\".";
-
-    // - Construct the mask of each sequence.
-    for (int i = 0; i < cur_batch_size_; ++i) {
-      int64_t tree_size = sequences[i]->token_tree_parent_ptr.size();
-      std::vector<std::vector<int32_t>> mask;
-      std::vector<int32_t> depth;
-      mask.reserve(tree_size);
-      depth.reserve(tree_size);
-      sequences[i]->is_chain = true;
-      sequences[i]->accepted_indices_committed = false;
-      for (int64_t n = 0; n < tree_size; ++n) {
-        CHECK_LT(sequences[i]->token_tree_parent_ptr[n], n)
-            << "Invalid token tree. The parent of node " << n << " in tree " << i << " is "
-            << sequences[i]->token_tree_parent_ptr[n] << ", which is not smaller than " << n;
-        CHECK_GE(sequences[i]->token_tree_parent_ptr[n], -1)
-            << "Invalid token tree. The parent of node " << n << " in tree " << i << " is "
-            << sequences[i]->token_tree_parent_ptr[n];
-        if (sequences[i]->token_tree_parent_ptr[n] != n - 1) {
-          // The parent of the current node is not the last node.
-          // Therefore the tree is not a chain.
-          sequences[i]->is_chain = false;
-          is_chain = false;
-        }
-
-        std::vector<int32_t> single_pos_mask;
-        if (sequences[i]->token_tree_parent_ptr[n] != -1) {
-          // The current node has a parent in the token tree.
-          single_pos_mask = {mask[sequences[i]->token_tree_parent_ptr[n]].begin(),
-                             mask[sequences[i]->token_tree_parent_ptr[n]].end()};
-          depth.push_back(depth[sequences[i]->token_tree_parent_ptr[n]] + 1);
-        } else {
-          // The current node is root in the token tree.
-          single_pos_mask.resize(tree_size, /*value=*/0);
-          depth.push_back(0);
-        }
-        single_pos_mask[n] = 1;
-        mask.push_back(single_pos_mask);
-        for (int32_t mask_val : single_pos_mask) {
-          tree_attn_mask_host_.push_back(mask_val);
-        }
+  void ConstructTokenTreeMask(const std::vector<Sequence*>& sequences,
+                              const IntTuple& token_tree_parent_ptr,
+                              const std::vector<std::vector<int32_t>>& block_ids_on_depths,
+                              const std::vector<std::vector<int32_t>>& trailing_blocks) {
+    // Check whether the token tree of a sequence should be handled at the current depth.
+    auto check_for_sequence = [&](int seq_i, int depth) -> bool {
+      if (!append_before_attn_) {
+        return true;
       }
-      sequences[i]->token_tree_node_depths = std::move(depth);
+      // Check if the last block of the sequence is on the current depth.
+      if (block_ids_on_depths[depth][seq_i] == sequences[seq_i]->last_block_idx ||
+          (depth + 1 == kPagedKVCacheMaxBlockDepth && !trailing_blocks[seq_i].empty())) {
+        return true;
+      }
+      return false;
+    };
+    for (int d = 0; d < num_depths_; ++d) {
+      // We check if the token tree deteriorates to a chain,
+      // because chain cases can have simplified attention work flow.
+      ICHECK_LT(d, tree_attn_mask_host_.size());
+      ICHECK_LT(d, tree_attn_mn_indptr_host_.size());
+      HostMemoryVector& tree_attn_mn_indptr = tree_attn_mn_indptr_host_[d];
+      HostMemoryVector& tree_attn_mask = tree_attn_mask_host_[d];
+
+      std::vector<bool> seq_in_current_depth(cur_batch_size_, false);
+
+      tree_attn_mn_indptr.clear();
+      tree_attn_mask.clear();
+      std::fill(is_chain_on_depths_.begin(), is_chain_on_depths_.end(), true);
+
+      bool is_chain = true;
+      // - Construct the mn indptr array, which is the indptr of the mask size of each sequence.
+      tree_attn_mn_indptr.push_back(0);
+      ICHECK_EQ(sequences.size(), cur_batch_size_);
+      ICHECK_EQ(cur_append_lengths_.size(), cur_batch_size_);
+      int64_t token_tree_parent_ptr_offset = 0;
+      for (int i = 0; i < cur_batch_size_; ++i) {
+        int64_t append_length = cur_append_lengths_[i];
+        seq_in_current_depth[i] = check_for_sequence(i, d);
+        if (!seq_in_current_depth[i]) {
+          tree_attn_mn_indptr.push_back(tree_attn_mn_indptr.back());
+          token_tree_parent_ptr_offset += append_length;  // Skip the token tree of this sequence.
+          continue;
+        }
+        // Update the token tree parent pointers.
+        CHECK_LE(sequences[i]->token_tree_parent_ptr.size(),
+                 global_block_pool_[sequences[i]->last_block_idx].seq_length)
+            << "The token tree size is larger than the sequence length of the last block.";
+        std::copy(token_tree_parent_ptr.begin() + token_tree_parent_ptr_offset,
+                  token_tree_parent_ptr.begin() + token_tree_parent_ptr_offset + append_length,
+                  std::back_inserter(sequences[i]->token_tree_parent_ptr));
+        token_tree_parent_ptr_offset += append_length;
+
+        CHECK_LE(sequences[i]->token_tree_parent_ptr.size(), kTreeAttnMaxTreeSize)
+            << "The tree size is " << append_length << " which exceeds the maximum tree size limit "
+            << kTreeAttnMaxTreeSize;
+        tree_attn_mn_indptr.push_back(tree_attn_mn_indptr.back() +
+                                      sequences[i]->token_tree_parent_ptr.size());
+      }
+      CHECK_EQ(token_tree_parent_ptr.size(), token_tree_parent_ptr_offset)
+          << "Invalid token tree size. The sum of \"append_lengths\" is "
+          << token_tree_parent_ptr_offset << " while there are " << token_tree_parent_ptr.size()
+          << " elements in \"token_tree_parent_ptr\".";
+
+      // - Construct the mask of each sequence.
+      for (int i = 0; i < cur_batch_size_; ++i) {
+        if (!seq_in_current_depth[i]) {
+          continue;
+        }
+        int64_t tree_size = sequences[i]->token_tree_parent_ptr.size();
+        std::vector<std::vector<int32_t>> mask;
+        std::vector<int32_t> depth;
+        mask.reserve(tree_size);
+        depth.reserve(tree_size);
+        sequences[i]->is_chain = true;
+        sequences[i]->accepted_indices_committed = false;
+        std::unordered_map<int, std::vector<int>> tree_parent_to_children;
+        std::vector<int> tree_roots;
+        for (int n = 0; n < tree_size; ++n) {
+          CHECK_LT(sequences[i]->token_tree_parent_ptr[n], n)
+              << "Invalid token tree. The parent of node " << n << " in tree " << i << " is "
+              << sequences[i]->token_tree_parent_ptr[n] << ", which is not smaller than " << n;
+          CHECK_GE(sequences[i]->token_tree_parent_ptr[n], -1)
+              << "Invalid token tree. The parent of node " << n << " in tree " << i << " is "
+              << sequences[i]->token_tree_parent_ptr[n];
+          if (sequences[i]->token_tree_parent_ptr[n] != n - 1) {
+            // The parent of the current node is not the last node.
+            // Therefore the tree is not a chain.
+            sequences[i]->is_chain = false;
+            is_chain = false;
+          }
+          tree_parent_to_children[sequences[i]->token_tree_parent_ptr[n]].push_back(n);
+
+          if (sequences[i]->token_tree_parent_ptr[n] != -1) {
+            depth.push_back(depth[sequences[i]->token_tree_parent_ptr[n]] + 1);
+          } else {
+            depth.push_back(0);
+            tree_roots.push_back(n);
+          }
+        }
+        std::vector<std::pair<int, int>> tree_order(tree_size);
+        int order = 0;
+        std::function<int(int)> tree_dfs = [&order, &tree_order, &tree_parent_to_children,
+                                            &tree_dfs](int node) -> int {
+          tree_order[node].first = order++;
+          int upper_bound = tree_order[node].first + 1;
+          for (int child : tree_parent_to_children[node]) {
+            upper_bound = std::max(upper_bound, tree_dfs(child));
+          }
+          tree_order[node].second = upper_bound;
+          return upper_bound;
+        };
+        for (auto root : tree_roots) {
+          tree_dfs(root);
+        }
+        for (int n = 0; n < tree_size; ++n) {
+          tree_attn_mask.push_back(tree_order[n].first);
+          tree_attn_mask.push_back(tree_order[n].second);
+        }
+        sequences[i]->token_tree_node_depths = std::move(depth);
+      }
+
+      is_chain_on_depths_[d] = is_chain;
+
+      if (!append_before_attn_) {
+        break;
+      }
     }
-    return is_chain;
   }
 
   /*!
@@ -2202,7 +2317,7 @@ class PagedAttentionKVCacheObj : public AttentionKVCacheObj {
     }
     double coalesce_ratio = 1.0 * page_counter_uncoalesced / page_counter_coalesced;
     // Do not coalesce and use batch decode kernel when coalesce ratio is small.
-    bool use_decode_kernel = is_decode_request_ && coalesce_ratio < 1.1;
+    bool use_decode_kernel = is_decode_request_ && coalesce_ratio < 32;
     return {use_decode_kernel || !enable_coalesce ? uncoalesced_block_ids : coalesced_block_ids,
             use_decode_kernel};
   }
@@ -2221,13 +2336,12 @@ class PagedAttentionKVCacheObj : public AttentionKVCacheObj {
     }
 
     if (!append_before_attn_) {
-      if (is_chain_) {
+      if (is_chain_on_depths_[0]) {
         f_attention_prefill_ragged_begin_forward_.value()(
-            temp_attn_workspace_[0], cur_append_lengths_indptr_host_.as_ndarray(),
+            temp_float_attn_workspace_, temp_int_attn_workspace_[0],
+            cur_append_lengths_indptr_host_.as_ndarray(),
             cur_append_lengths_indptr_host_.as_ndarray(), cur_batch_size_, num_qo_heads_,
             num_kv_heads_, head_dim_, copy_stream_);
-      } else {
-        LOG(FATAL) << "Kernel BeginForward doesn't support tree attn.";
       }
     }
     for (int d = 0; d < num_depths_; ++d) {
@@ -2237,14 +2351,15 @@ class PagedAttentionKVCacheObj : public AttentionKVCacheObj {
       CHECK(!support_sliding_window_) << "Kernel BeginForward doesn't support sliding window.";
       if (use_decode_kernel_[d]) {
         f_attention_decode_begin_forward_.value()(
-            d, temp_attn_workspace_[d + 1], page_indptr_on_depths_host_[d].as_ndarray(),
+            d, temp_float_attn_workspace_, temp_int_attn_workspace_[d + 1],
+            page_indptr_on_depths_host_[d].as_ndarray(),
             last_page_len_on_depths_host_[d].as_ndarray(), num_qo_heads_, num_kv_heads_, head_dim_,
             page_size_,
             /*rotary_mode=*/rope_mode_ == RoPEMode::kInline, copy_stream_);
       } else {
         f_attention_prefill_begin_forward_.value()(
-            /*depth=*/d, temp_attn_workspace_[d + 1], qo_indptr_on_depths_host_[d].as_ndarray(),
-            page_indptr_on_depths_host_[d].as_ndarray(),
+            /*depth=*/d, temp_float_attn_workspace_, temp_int_attn_workspace_[d + 1],
+            qo_indptr_on_depths_host_[d].as_ndarray(), page_indptr_on_depths_host_[d].as_ndarray(),
             static_cast<int>(page_indptr_on_depths_host_[d].size()) - 1, num_qo_heads_,
             num_kv_heads_, head_dim_, page_size_, copy_stream_);
       }
@@ -2270,7 +2385,7 @@ class PagedAttentionKVCacheObj : public AttentionKVCacheObj {
     if (!append_before_attn_) {
       // The first part of attention, which only involves the q and the newly appended k/v.
       is_first_kernel = false;
-      if (is_chain_) {
+      if (is_chain_on_depths_[0]) {
         // If the batch does not form a tree, use raggedness prefill kernel.
         f_attention_prefill_ragged_(q_data, cur_append_length_indptr_view_, k_data, v_data,
                                     cur_append_length_indptr_view_, q_rope_position_map_view_,
@@ -2281,14 +2396,14 @@ class PagedAttentionKVCacheObj : public AttentionKVCacheObj {
                                     rotary_theta_, attn_score_scaling_factor);
       } else {
         // The batch requires tree attention.
-        ICHECK(tree_attn_mask_view_.defined());
-        ICHECK(tree_attn_mn_indptr_view_.defined());
         ICHECK(f_attention_prefill_with_tree_mask_.defined())
             << "Function \"f_attention_prefill_with_tree_mask_\" is not defined.";
+        ICHECK(tree_attn_mask_view_[0].defined());
+        ICHECK(tree_attn_mn_indptr_view_[0].defined());
         f_attention_prefill_with_tree_mask_(
             q_data, cur_append_length_indptr_view_, k_data, v_data, cur_append_length_indptr_view_,
-            q_rope_position_map_view_, tree_attn_mn_indptr_view_, tree_attn_mask_view_, output,
-            merged_attn_scores_view_, /*rotary_mode=*/rope_mode_ == RoPEMode::kInline,
+            q_rope_position_map_view_, tree_attn_mn_indptr_view_[0], tree_attn_mask_view_[0],
+            output, merged_attn_scores_view_, /*rotary_mode=*/rope_mode_ == RoPEMode::kInline,
             rotary_scale_, rotary_theta_, attn_score_scaling_factor, cur_batch_size_);
       }
     }
@@ -2306,7 +2421,15 @@ class PagedAttentionKVCacheObj : public AttentionKVCacheObj {
         attn_output = temp_attn_output_view_;
         attn_scores = temp_attn_scores_view_;
       }
-      if (use_decode_kernel_[d]) {
+      if (append_before_attn_ && !is_chain_on_depths_[d]) {
+        f_attention_prefill_with_tree_mask_paged_kv_(
+            /*depth=*/d, q_data, qo_indptr_on_depths_view_[d], pages_[local_layer_id],
+            page_indptr_on_depths_view_[d], page_indices_on_depths_view_[d],
+            length_info_on_depths_view_[d], k_rope_pos_offset_view_[d], q_rope_position_map_view_,
+            attn_output, attn_scores,
+            /*rotary_mode=*/rope_mode_ == RoPEMode::kInline, rotary_scale_, rotary_theta_,
+            attn_score_scaling_factor, tree_attn_mn_indptr_view_[d], tree_attn_mask_view_[d]);
+      } else if (use_decode_kernel_[d]) {
         // Use decode kernel for depth d
         f_decode(/*depth=*/d, q_data, pages_[local_layer_id], page_indptr_on_depths_view_[d],
                  page_indices_on_depths_view_[d], length_info_on_depths_view_[d],
@@ -2431,13 +2554,13 @@ class PagedAttentionKVCacheObj : public AttentionKVCacheObj {
     append_position_map_view_ =
         aux_data_manager_->CopyAppendPositionMapAsync(&append_position_map_host_);
     // 10. tree_attn_mask and tree_attn_mn_indptr
-    if (!is_chain_) {
-      tree_attn_mask_view_ = aux_data_manager_->CopyTreeAttnMaskAsync(&tree_attn_mask_host_);
-      tree_attn_mn_indptr_view_ =
-          aux_data_manager_->CopyTreeAttnMNIndptrAsync(&tree_attn_mn_indptr_host_);
-    } else {
-      tree_attn_mask_view_ = NDArray{nullptr};
-      tree_attn_mn_indptr_view_ = NDArray{nullptr};
+    for (int d = 0; d < num_depths_; ++d) {
+      if (!is_chain_on_depths_[d]) {
+        tree_attn_mask_view_[d] =
+            aux_data_manager_->CopyTreeAttnMaskOnDepthAsync(&tree_attn_mask_host_[d], d);
+        tree_attn_mn_indptr_view_[d] =
+            aux_data_manager_->CopyTreeAttnMNIndptrOnDepthAsync(&tree_attn_mn_indptr_host_[d], d);
+      }
     }
     // 11. Create view for temporary arrays for attention computation.
     temp_attn_output_view_ = temp_attn_output_device_.CreateView(
@@ -2462,7 +2585,7 @@ TVM_REGISTER_OBJECT_TYPE(PagedAttentionKVCacheObj);
 
 TVM_REGISTER_GLOBAL("vm.builtin.paged_attention_kv_cache_create")
     .set_body([](TVMArgs args, TVMRetValue* rv) {
-      CHECK(args.size() == 25 || args.size() == 26 || args.size() == 27)
+      CHECK(args.size() == 28 || args.size() == 29)
           << "Invalid number of KV cache constructor args.";
       ShapeTuple cache_config = args[0];
       ShapeTuple layer_indptr_tuple = args[1];
@@ -2499,14 +2622,13 @@ TVM_REGISTER_GLOBAL("vm.builtin.paged_attention_kv_cache_create")
       PackedFunc f_split_rotary = args[22];
       PackedFunc f_copy_single_page = args[23];
       Optional<PackedFunc> f_debug_get_kv = args[24];
-      PackedFunc f_compact_copy{nullptr};
-      PackedFunc f_attention_prefill_with_tree_mask{nullptr};
+      PackedFunc f_compact_copy = args[25];
+      PackedFunc f_attention_prefill_with_tree_mask = args[26];
+      PackedFunc f_attention_prefill_with_tree_mask_paged_kv = args[27];
+      Optional<NDArray> rope_ext_factors = NullOpt;
 
-      if (args.size() >= 26) {
-        f_compact_copy = args[25].AsObjectRef<PackedFunc>();
-      }
-      if (args.size() >= 27) {
-        f_attention_prefill_with_tree_mask = args[26].AsObjectRef<PackedFunc>();
+      if (args.size() >= 29 && args[28].IsObjectRef<NDArray>()) {
+        rope_ext_factors = args[28].AsObjectRef<NDArray>();
       }
 
       CHECK_EQ(cache_config.size(), 5);
@@ -2523,11 +2645,13 @@ TVM_REGISTER_GLOBAL("vm.builtin.paged_attention_kv_cache_create")
       ObjectPtr<PagedAttentionKVCacheObj> n = make_object<PagedAttentionKVCacheObj>(
           page_size, num_layers, layer_id_begin_offset, num_qo_heads, num_kv_heads, head_dim,
           reserved_num_seqs, num_total_pages, prefill_chunk_size, support_sliding_window,
-          RoPEMode(rope_mode), rotary_scale, rotary_theta, init->dtype, init->device,
-          std::move(f_transpose_append), std::move(f_compact_copy), std::move(f_attention_prefill),
-          std::move(f_attention_decode), std::move(f_attention_prefill_sliding_window),
+          RoPEMode(rope_mode), rotary_scale, rotary_theta, std::move(rope_ext_factors),  //
+          init->dtype, init->device, std::move(f_transpose_append), std::move(f_compact_copy),
+          std::move(f_attention_prefill), std::move(f_attention_decode),
+          std::move(f_attention_prefill_sliding_window),
           std::move(f_attention_decode_sliding_window), std::move(f_attention_prefill_ragged),
           std::move(f_attention_prefill_with_tree_mask),
+          std::move(f_attention_prefill_with_tree_mask_paged_kv),
           std::move(f_attention_prefill_ragged_begin_forward),
           std::move(f_attention_prefill_ragged_end_forward),
           std::move(f_attention_prefill_begin_forward), std::move(f_attention_prefill_end_forward),
@@ -2539,7 +2663,7 @@ TVM_REGISTER_GLOBAL("vm.builtin.paged_attention_kv_cache_create")
 
 TVM_REGISTER_GLOBAL("vm.builtin.paged_attention_kv_cache_create_reduced")
     .set_body([](TVMArgs args, TVMRetValue* rv) {
-      CHECK(args.size() == 19 || args.size() == 20 || args.size() == 21)
+      CHECK(args.size() == 22 || args.size() == 23)
           << "Invalid number of KV cache constructor args.";
       ShapeTuple cache_config = args[0];
       ShapeTuple layer_indptr_tuple = args[1];
@@ -2570,14 +2694,13 @@ TVM_REGISTER_GLOBAL("vm.builtin.paged_attention_kv_cache_create_reduced")
       PackedFunc f_split_rotary = args[16];
       PackedFunc f_copy_single_page = args[17];
       Optional<PackedFunc> f_debug_get_kv = args[18];
-      PackedFunc f_compact_copy{nullptr};
-      PackedFunc f_attention_prefill_with_tree_mask{nullptr};
+      PackedFunc f_compact_copy = args[19];
+      PackedFunc f_attention_prefill_with_tree_mask = args[20];
+      PackedFunc f_attention_prefill_with_tree_mask_paged_kv = args[21];
+      Optional<NDArray> rope_ext_factors = NullOpt;
 
-      if (args.size() >= 20) {
-        f_compact_copy = args[19].AsObjectRef<PackedFunc>();
-      }
-      if (args.size() >= 21) {
-        f_attention_prefill_with_tree_mask = args[20].AsObjectRef<PackedFunc>();
+      if (args.size() >= 23 && args[22].IsObjectRef<NDArray>()) {
+        rope_ext_factors = args[22].AsObjectRef<NDArray>();
       }
 
       CHECK_EQ(cache_config.size(), 5);
@@ -2594,12 +2717,14 @@ TVM_REGISTER_GLOBAL("vm.builtin.paged_attention_kv_cache_create_reduced")
       ObjectPtr<PagedAttentionKVCacheObj> n = make_object<PagedAttentionKVCacheObj>(
           page_size, num_layers, layer_id_begin_offset, num_qo_heads, num_kv_heads, head_dim,
           reserved_num_seqs, num_total_pages, prefill_chunk_size, support_sliding_window,
-          RoPEMode(rope_mode), rotary_scale, rotary_theta, init->dtype, init->device,
-          std::move(f_transpose_append), std::move(f_compact_copy), std::move(f_attention_prefill),
-          std::move(f_attention_decode), std::move(f_attention_prefill_sliding_window),
+          RoPEMode(rope_mode), rotary_scale, rotary_theta, std::move(rope_ext_factors),  //
+          init->dtype, init->device, std::move(f_transpose_append), std::move(f_compact_copy),
+          std::move(f_attention_prefill), std::move(f_attention_decode),
+          std::move(f_attention_prefill_sliding_window),
           std::move(f_attention_decode_sliding_window), std::move(f_attention_prefill_ragged),
-          std::move(f_attention_prefill_with_tree_mask),         //
-          NullOpt, NullOpt, NullOpt, NullOpt, NullOpt, NullOpt,  //
+          std::move(f_attention_prefill_with_tree_mask),           //
+          std::move(f_attention_prefill_with_tree_mask_paged_kv),  //
+          NullOpt, NullOpt, NullOpt, NullOpt, NullOpt, NullOpt,    //
           std::move(f_merge_inplace), std::move(f_split_rotary), std::move(f_copy_single_page),
           std::move(f_debug_get_kv));
       *rv = AttentionKVCache(std::move(n));
