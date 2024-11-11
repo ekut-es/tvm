@@ -25,6 +25,7 @@ pub mod function;
 pub mod module;
 pub mod op;
 pub mod relay;
+pub mod relax;
 pub mod source_map;
 pub mod span;
 pub mod tir;
